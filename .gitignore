@@ -5,3 +5,4 @@ reports/*.html
 screenshots/**/*.png
 traces/*.zip
 selenium-traces/
+.env
