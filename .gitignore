@@ -6,3 +6,5 @@ screenshots/**/*.png
 traces/*.zip
 selenium-traces/
 .env
+logs
+reports

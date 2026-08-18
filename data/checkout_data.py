@@ -1,1 +1,3 @@
-VALID_CUSTOMER = {"first_name": "Ada", "last_name": "Lovelace", "postal_code": "12345"}
+from config.site_config import DEFAULT_CONFIG
+
+VALID_CUSTOMER = DEFAULT_CONFIG.customers["default"]

@@ -6,12 +6,13 @@ import logging
 import os
 import re
 import shutil
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 import pytest
+
+from config.site_config import DEFAULT_CONFIG
 
 PASS_LEVEL = 25
 FAIL_LEVEL = 35
@@ -36,11 +37,8 @@ except ImportError:  # pragma: no cover
 
 load_dotenv()
 from playwright.sync_api import Browser, Page, sync_playwright
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 
-BASE_URL = "https://www.saucedemo.com/"
+BASE_URL = os.getenv("BASE_URL", DEFAULT_CONFIG.base_url)
 LOGS_DIR = Path("logs")
 LOG_FILE: Path | None = None
 LOG_HANDLER: logging.Handler | None = None
@@ -49,6 +47,36 @@ TEST_RESULTS: list[dict] = []
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GENINI_API_KEY")
 REPORTS_DIR = Path("reports")
 BUG_REPORT_DIR = REPORTS_DIR / "bug_reports"
+ERROR_TOKENS = (
+    "AssertionError",
+    "TimeoutError",
+    "ElementNotFound",
+    "NoSuchElementException",
+    "WebDriverException",
+    "HTTPError",
+    "Exception",
+    "Error",
+)
+
+
+def _normalize_error_line(line: str) -> str:
+    cleaned = line.strip()
+    if cleaned.startswith("E "):
+        cleaned = cleaned[2:].strip()
+    return cleaned
+
+
+def _is_noise_line(line: str) -> bool:
+    cleaned = line.strip()
+    if not cleaned:
+        return True
+    if cleaned.startswith(("page =", "test_meta =", "qa_log =", "> ")):
+        return True
+    return "rewrite_error" in cleaned or "apiName" in cleaned
+
+
+def _safe_test_name(nodeid: str) -> str:
+    return nodeid.replace("::", "_").replace("/", "_").replace("\\", "_")
 
 
 def _infer_test_procedure(nodeid: str) -> list[str]:
@@ -88,6 +116,32 @@ def _infer_expected_result(nodeid: str) -> str:
     return "테스트는 정상적으로 수행되며, 의도된 동작 결과가 기대값과 일치해야 한다."
 
 
+def _extract_key_error_lines(raw_text: str) -> str:
+    text = str(raw_text or "").replace("\\n", "\n")
+    if not text:
+        return ""
+
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    for line in text.splitlines():
+        cleaned = _normalize_error_line(line)
+        if _is_noise_line(cleaned):
+            continue
+        if any(token in cleaned for token in ERROR_TOKENS):
+            if cleaned not in seen:
+                seen.add(cleaned)
+                lines.append(cleaned)
+        elif "locator" in cleaned.lower() and ("timeout" in cleaned.lower() or "not found" in cleaned.lower()):
+            if cleaned not in seen:
+                seen.add(cleaned)
+                lines.append(cleaned)
+
+    if not lines:
+        return ""
+    return "\n".join(lines[:4])
+
+
 def _summarize_actual_result(record: dict) -> str:
     raw_text = (record.get("actual") or record.get("longrepr") or "실제 결과를 확인할 수 없습니다.")
     text = str(raw_text).replace("\\n", "\n")
@@ -106,23 +160,86 @@ def _summarize_actual_result(record: dict) -> str:
                 return clean_detail.strip()
 
     for line in text.splitlines():
-        cleaned = line.strip()
-        if not cleaned or cleaned.startswith("page =") or cleaned.startswith("test_meta =") or cleaned.startswith("qa_log =") or cleaned.startswith("> "):
+        cleaned = _normalize_error_line(line)
+        if _is_noise_line(cleaned):
             continue
-        if any(token in cleaned for token in ["AssertionError", "TimeoutError", "ElementNotFound", "NoSuchElementException"]):
+        if cleaned.startswith(("expected=", "actual=", "assert ")):
+            continue
+        if any(token in cleaned for token in ERROR_TOKENS[:5]):
             return cleaned
-        if cleaned.startswith("E "):
-            return cleaned[2:].strip()
-        if "rewrite_error" in cleaned or "apiName" in cleaned:
-            continue
+        if cleaned:
+            return cleaned
 
     short = text.strip().splitlines()
     if short:
         summary = short[0].strip()
+        if summary.startswith(("expected=", "actual=")):
+            return "실제 결과를 확인할 수 없습니다."
         if len(summary) > 220:
             return summary[:220].rstrip() + "..."
         return summary
     return "실제 결과를 확인할 수 없습니다."
+
+
+def _compact_log_block(raw_text: str, *, max_lines: int = 18, max_chars: int = 3500) -> str:
+    text = str(raw_text or "").replace("\\n", "\n").strip()
+    if not text:
+        return "로그 없음"
+
+    compact_mode = os.getenv("BUG_REPORT_COMPACT_LOGS", "true").lower() in {"1", "true", "yes", "y"}
+    if not compact_mode:
+        return text
+
+    if len(text) <= max_chars and len(text.splitlines()) <= max_lines:
+        return text
+
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text[:max_chars].rstrip() + "\n... (로그가 일부 생략되었습니다.)"
+
+    keep_head = max(4, max_lines // 2)
+    keep_tail = max_lines - keep_head
+    trimmed = lines[:keep_head] + ["... (로그가 일부 생략되었습니다.) ..."] + lines[-keep_tail:]
+    return "\n".join(trimmed)
+
+
+def _describe_textual_actual_result(raw_text: str) -> str:
+    text = str(raw_text or "").replace("\\n", "\n")
+    if not text:
+        return "실제 결과는 기대한 텍스트가 화면에 나타나지 않는 상태로 확인되었습니다."
+
+    lower = text.lower()
+
+    if "waiting for locator" in lower and ".summary_total_label" in lower:
+        return "로그를 기준으로 보면 체크아웃 페이지에서 총액 영역(.summary_total_label)이 나타나지 않아 주문 총액을 읽는 단계에서 타임아웃이 발생한 것으로 보입니다. 즉, 다음 단계의 화면 전환 또는 총액 렌더링이 완료되지 않아 실패한 상태입니다."
+    if "first name is required" in lower:
+        return "로그를 기준으로 보면 이름 입력이 비어 있어 체크아웃 유효성 검증이 실패한 것으로 보입니다. 필수 정보 누락으로 다음 단계 이동이 막힌 상태입니다."
+    if "timeout" in lower and "locator" in lower:
+        return "로그를 기준으로 보면 특정 요소를 찾지 못해 대기 시간이 초과된 것으로 보입니다. 페이지 상태가 기대와 달라서 다음 동작을 수행하지 못한 상태입니다."
+    if "assertionerror" in lower or "assert " in lower:
+        return "로그를 기준으로 보면 기대 값과 실제 값이 일치하지 않아 검증 단계가 실패한 것으로 보입니다. 결과값이 기대 조건과 다르게 도출된 상태입니다."
+
+    candidates: list[str] = []
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if not cleaned or cleaned.startswith("page =") or cleaned.startswith("test_meta =") or cleaned.startswith("qa_log =") or cleaned.startswith("> "):
+            continue
+        if cleaned.startswith("E "):
+            cleaned = cleaned[2:].strip()
+        if cleaned.startswith("expected=") or cleaned.startswith("actual=") or cleaned.startswith("assert "):
+            continue
+        if "rewrite_error" in cleaned or "apiName" in cleaned:
+            continue
+        if cleaned and len(cleaned) < 220:
+            candidates.append(cleaned)
+
+    if candidates:
+        first = candidates[0]
+        if first.startswith("except Exception as error:"):
+            first = "오류가 발생한 상태"
+        return f"로그를 기준으로 보면 '{first}'가 발생하면서 실패가 확인되었습니다. 이로 인해 기대한 화면 동작을 완료하지 못한 상태로 보입니다."
+
+    return "로그를 기준으로 보면 기대한 화면 상태가 도달하지 못했고, 검증 단계에서 실패가 발생한 것으로 보입니다."
 
 
 def build_bug_report_content(
@@ -140,28 +257,41 @@ def build_bug_report_content(
 ) -> str:
     safe_procedure = procedure or _infer_test_procedure(test_name)
     safe_expected = expected or _infer_expected_result(test_name)
+    inferred_failure = _describe_textual_actual_result(error_log or actual or "")
+    safe_actual = inferred_failure or (actual or "실제 결과를 확인할 수 없습니다.").strip()
+    safe_error_log = (error_log or safe_actual).strip()
+    full_error_log = str(safe_error_log).replace("\\n", "\n")
     proc_block = "\n".join(f"{idx}. {step}" for idx, step in enumerate(safe_procedure, start=1))
+
+    scenario_name = condition.strip() or "테스트 시나리오 확인 불가"
+    actual_result_lines = [safe_actual]
+    actual_result_lines.append("")
+    actual_result_lines.append("원인 분석:")
+    actual_result_lines.append(inferred_failure or safe_actual)
+
     return f"""# {test_name} 실패 보고서
 
+## 1. 요약
 - 발생 일자: {timestamp}
 - 테스트명: {test_name}
-- 조건: {condition}
+- 조건: {condition or '조건 정보 없음'}
+- 시나리오: {scenario_name}
 
-## 절차
+## 2. 재현 절차
 {proc_block}
 
-## 예상 결과
+## 3. 기대 결과
 {safe_expected}
 
-## 실제 결과
-{actual}
+## 4. 실제 결과
+{chr(10).join(actual_result_lines)}
 
-## 실패 로그
+## 5. 실패 로그
 ```text
-{error_log}
+{_compact_log_block(full_error_log)}
 ```
 
-## 증거
+## 6. 증거
 - 스크린샷: {screenshot_path or '없음'}
 - 로그: {log_path or '없음'}
 - Trace: {trace_path or '없음'}
@@ -172,7 +302,7 @@ def _generate_bug_report_with_gemini(payload: dict) -> str:
     if not GEMINI_API_KEY:
         return ""
 
-    prompt = f"""당신은 QA 자동화 팀의 버그 리포트 작성 도우미입니다.
+    prompt = """당신은 QA 자동화 팀의 버그 리포트 작성 도우미입니다.
 다음 테스트 실패 정보를 기반으로 한글 버그 리포트를 작성해주세요.
 반드시 아래 항목을 포함하세요:
 - 발생 일자
@@ -183,9 +313,11 @@ def _generate_bug_report_with_gemini(payload: dict) -> str:
 
 중요 규칙:
 - 실제 결과는 내부 구현 코드 문자열을 그대로 적지 마세요.
-- `raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None` 같은 내부 스택프레임/라이브러리 구현 문구는 절대 그대로 적지 마세요.
-- 실제 결과는 사용자가 이해할 수 있는 한글 문장으로 핵심 오류만 요약하세요.
-- 예시: "로그인 시도 시 비밀번호가 일치하지 않아 인증 실패" 또는 "결제 금액 영역을 찾지 못해 총액 검증 단계에서 TimeoutError 발생"
+- `raise rewrite_error(error, f"{{parsed_st['apiName']}}: {{error}}") from None` 같은 내부 스택프레임, 에러 래퍼, 라이브러리 구현 문구는 절대 그대로 적지 마세요.
+- 로그에 보이는 실패 원인만 근거로 사용하여, 사용자 이해가 가능한 한글 문장으로 요약하세요.
+- 실제 결과는 반드시 "로그상 ... 때문에 ...한 것으로 보입니다" 형태로 설명하세요.
+- 예시: "로그상 총액 영역(.summary_total_label)을 찾지 못해 30초 대기 후 타임아웃이 발생한 것으로 보입니다." 또는 "로그상 이름 입력값이 비어 있어 유효성 검사에서 실패한 것으로 보입니다."
+- `expected=...`, `actual=...`, `assert ...` 같은 pytest 내부 표현식은 절대 적지 마세요.
 
 출력 형식:
 1. 제목
@@ -198,20 +330,31 @@ def _generate_bug_report_with_gemini(payload: dict) -> str:
 8. 실패 로그
 9. 증거
 
-한글로 작성하고, 로그 기반으로 객관적으로 작성해주세요.
+한글로 작성하고, 로그를 근거로 한 추정과 원인 설명을 깔끔하게 구성해주세요.
 
 테스트 정보:
-- 테스트명: {payload['test_name']}
-- 발생 일자: {payload['timestamp']}
-- 조건: {payload['condition']}
-- 절차: {payload['procedure']}
-- 예상 결과: {payload['expected']}
-- 실제 결과: {payload['actual']}
-- 실패 로그: {payload['error_log']}
-- 스크린샷 경로: {payload['screenshot_path']}
-- 로그 경로: {payload['log_path']}
-- trace 경로: {payload['trace_path']}
-"""
+- 테스트명: {test_name}
+- 발생 일자: {timestamp}
+- 조건: {condition}
+- 절차: {procedure}
+- 예상 결과: {expected}
+- 실제 결과: {actual}
+- 실패 로그: {error_log}
+- 스크린샷 경로: {screenshot_path}
+- 로그 경로: {log_path}
+- trace 경로: {trace_path}
+""".format(
+        test_name=payload["test_name"],
+        timestamp=payload["timestamp"],
+        condition=payload["condition"],
+        procedure=payload["procedure"],
+        expected=payload["expected"],
+        actual=payload["actual"],
+        error_log=payload["error_log"],
+        screenshot_path=payload["screenshot_path"],
+        log_path=payload["log_path"],
+        trace_path=payload["trace_path"],
+    )
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -242,44 +385,57 @@ def _generate_bug_report_with_gemini(payload: dict) -> str:
     return ""
 
 
-def save_bug_report(record: dict) -> str | None:
-    nodeid = record.get("nodeid") or "unknown_test"
-    safe_name = nodeid.replace("::", "_").replace("/", "_").replace("\\", "_")
+def _normalize_procedure(nodeid: str, record: dict) -> list[str]:
     meta = record.get("meta") or {}
-    procedure = meta.get("procedure") or [
-        step.get("description", "") for step in (record.get("steps") or []) if step.get("description")
-    ]
+    procedure = meta.get("procedure") or []
+    if not procedure:
+        procedure = [
+            step.get("description", "") for step in (record.get("steps") or []) if step.get("description")
+        ]
     if not procedure:
         procedure = _infer_test_procedure(nodeid)
+    return [step for step in procedure if step]
+
+
+def _build_bug_report_payload(record: dict) -> dict:
+    nodeid = record.get("nodeid") or "unknown_test"
+    meta = record.get("meta") or {}
+    safe_name = nodeid.replace("::", "_").replace("/", "_").replace("\\", "_")
+    procedure = _normalize_procedure(nodeid, record)
     condition = meta.get("condition") or "조건 정보 없음"
     expected = meta.get("expected") or _infer_expected_result(nodeid)
     actual = _summarize_actual_result(record)
     error_log = record.get("longrepr") or actual
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    screenshot_path = f"screenshots/{safe_name}_failed.png"
-    trace_path = f"traces/{safe_name}.zip"
-    log_path = str(LOG_FILE) if LOG_FILE is not None else ""
 
-    payload = {
+    return {
         "test_name": nodeid,
-        "timestamp": timestamp,
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "condition": condition,
         "procedure": procedure,
         "expected": expected,
         "actual": actual,
         "error_log": error_log,
-        "screenshot_path": screenshot_path,
-        "log_path": log_path,
-        "trace_path": trace_path,
+        "screenshot_path": f"screenshots/{safe_name}_failed.png",
+        "trace_path": f"traces/{safe_name}.zip",
+        "log_path": str(LOG_FILE) if LOG_FILE is not None else "",
     }
 
+
+def save_bug_report(record: dict) -> str | None:
+    payload = _build_bug_report_payload(record)
     local_report = build_bug_report_content(**payload)
-    generated_report = _generate_bug_report_with_gemini(payload) or local_report
+    try:
+        generated_report = _generate_bug_report_with_gemini(payload)
+    except Exception:
+        LOGGER.exception("Gemini bug report generation crashed; falling back to local report")
+        generated_report = ""
 
     BUG_REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    file_name = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name}.md"
+    safe_name = _safe_test_name(payload["test_name"])
+    safe_name = re.sub(r"[^A-Za-z0-9_\-]+", "_", safe_name).strip("_")
+    file_name = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_name}_bug_report.md"
     target_path = BUG_REPORT_DIR / file_name
-    target_path.write_text(generated_report, encoding="utf-8")
+    target_path.write_text(generated_report or local_report, encoding="utf-8")
     LOGGER.info("Bug report saved: %s", target_path)
     return str(target_path)
 
@@ -388,14 +544,6 @@ def pytest_unconfigure(config: pytest.Config) -> None:
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--headed", action="store_true", help="브라우저 창을 표시합니다.")
     parser.addoption("--slowmo", action="store", default=0, type=int, help="동작 사이 지연(ms)")
-    parser.addoption("--selenium-headed", action="store_true", help="Selenium Chrome 창을 표시합니다.")
-    parser.addoption(
-        "--chromedriver",
-        action="store",
-        default=os.getenv("CHROMEDRIVER_PATH"),
-        help="chromedriver.exe 경로 (또는 CHROMEDRIVER_PATH 환경 변수)",
-    )
-    parser.addoption("--step-delay", action="store", default=0, type=float, help="Selenium 단계별 지연(초)")
 
 
 class TestSteps:
@@ -515,7 +663,7 @@ def page(browser: Browser, request: pytest.FixtureRequest, test_steps: TestSteps
     failed = hasattr(request.node, "rep_call") and request.node.rep_call.failed
     if failed:
         LOGGER.warning("Test failed: capturing screenshot and trace for %s", request.node.nodeid)
-        safe_name = request.node.nodeid.replace("::", "_").replace("/", "_").replace("\\", "_")
+        safe_name = _safe_test_name(request.node.nodeid)
         Path("screenshots").mkdir(exist_ok=True)
         page.screenshot(path=f"screenshots/{safe_name}_failed.png", full_page=True)
         Path("traces").mkdir(exist_ok=True)
@@ -546,59 +694,6 @@ def test_meta(request: pytest.FixtureRequest):
     except Exception:
         pass
     yield meta
-
-
-@pytest.fixture
-def selenium_driver(request: pytest.FixtureRequest, test_steps: TestSteps):
-    """Use an explicit/cached ChromeDriver, falling back to Selenium Manager."""
-    options = Options()
-    if not request.config.getoption("--selenium-headed"):
-        options.add_argument("--headless=new")
-    options.add_argument("--window-size=1440,900")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    chrome_binary = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-    if chrome_binary.is_file():
-        options.binary_location = str(chrome_binary)
-
-    configured_path = request.config.getoption("--chromedriver")
-    if configured_path:
-        driver_path = Path(configured_path)
-        if not driver_path.is_file():
-            raise pytest.UsageError(f"ChromeDriver를 찾을 수 없습니다: {driver_path}")
-        driver = webdriver.Chrome(service=Service(str(driver_path)), options=options)
-    else:
-        # Selenium Manager cache prevents a new network lookup on later runs.
-        cached_drivers = sorted(Path.home().glob(".cache/selenium/chromedriver/*/*/chromedriver.exe"))
-        if cached_drivers:
-            driver = webdriver.Chrome(service=Service(str(cached_drivers[-1])), options=options)
-        else:
-            driver = webdriver.Chrome(options=options)
-    LOGGER.info("Starting Selenium driver for %s", request.node.nodeid)
-    driver.implicitly_wait(0)
-    driver.get(BASE_URL)
-    safe_name = request.node.nodeid.replace("::", "_").replace("/", "_").replace("\\", "_")
-    driver.evidence_dir = Path("screenshots") / safe_name
-    driver.evidence_step = 0
-    driver.step_delay = request.config.getoption("--step-delay")
-    # attach test steps collector to the driver so page objects can record steps
-    try:
-        driver.test_steps = test_steps
-    except Exception:
-        pass
-    if driver.evidence_dir.exists():
-        shutil.rmtree(driver.evidence_dir)
-    driver.evidence_dir.mkdir(parents=True, exist_ok=True)
-    driver.save_screenshot(str(driver.evidence_dir / "00_login_page.png"))
-    yield driver
-
-    failed = hasattr(request.node, "rep_call") and request.node.rep_call.failed
-    if failed:
-        LOGGER.warning("Selenium test failed: saving failed screenshot for %s", request.node.nodeid)
-        driver.save_screenshot(str(driver.evidence_dir / "failed.png"))
-    else:
-        LOGGER.info("Selenium test passed: closing driver for %s", request.node.nodeid)
-    driver.quit()
 
 
 @pytest.hookimpl(hookwrapper=True)

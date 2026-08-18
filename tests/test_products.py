@@ -1,5 +1,6 @@
 from playwright.sync_api import expect
 
+from config.site_config import DEFAULT_CONFIG
 from data.users import STANDARD_USER
 from pages.login_page import LoginPage
 from pages.products_page import ProductsPage
@@ -33,6 +34,16 @@ def test_sort_products_by_price_low_to_high(page):
     assert products.product_prices() == sorted(products.product_prices())
 
 
+# 가격 내림차순 정렬 동작을 검증한다.
+# 높은 가격 순으로 정렬을 적용한 뒤
+# 실제 표시 순서가 기대한 정렬 결과와 일치하는지 확인한다.
+# 사용자는 가장 비싼 상품을 빠르게 비교할 수 있어야 한다.
+def test_sort_products_by_price_high_to_low(page):
+    products = logged_in_products(page)
+    products.sort_by("hilo")
+    assert products.product_prices() == sorted(products.product_prices(), reverse=True)
+
+
 # 이름 내림차순 정렬 동작을 검증한다.
 # Z부터 A 순서로 정렬을 적용하고
 # 상품 명칭 배열이 예상 순서대로 정렬되는지 확인한다.
@@ -51,9 +62,9 @@ def test_sort_products_by_name_z_to_a(page):
 # 이 테스트는 상품 탐색의 핵심 경로를 점검한다.
 def test_product_detail_page_opens(page):
     products = logged_in_products(page)
-    products.open_product("Sauce Labs Backpack")
-    expect(page.get_by_text("Sauce Labs Backpack", exact=True)).to_be_visible()
-    expect(page).to_have_url("https://www.saucedemo.com/inventory-item.html?id=4")
+    products.open_product(DEFAULT_CONFIG.products["backpack"])
+    expect(page.get_by_text(DEFAULT_CONFIG.products["backpack"], exact=True)).to_be_visible()
+    expect(page).to_have_url(DEFAULT_CONFIG.base_url + "inventory-item.html?id=4")
 
 
 # 로그아웃이 정상적으로 동작하는지 검증한다.
@@ -64,5 +75,5 @@ def test_product_detail_page_opens(page):
 def test_logout_returns_to_login_page(page):
     products = logged_in_products(page)
     products.logout()
-    expect(page).to_have_url("https://www.saucedemo.com/")
-    expect(page.get_by_role("button", name="Login")).to_be_visible()
+    expect(page).to_have_url(DEFAULT_CONFIG.base_url)
+    expect(page.get_by_role("button", name=DEFAULT_CONFIG.selectors["login"]["submit_button"])).to_be_visible()
