@@ -39,11 +39,9 @@ def test_add_multiple_cart_items(page):
     assert CartPage(page).item_names() == [DEFAULT_CONFIG.products["backpack"], DEFAULT_CONFIG.products["bike_light"]]
 
 
-# 동일 상품을 연속으로 추가해도 장바구니에 중복 항목이 생기지 않는지 검증한다.
-# 사용자는 같은 SKU를 여러 번 누르더라도 장바구니에 중복 라인이 추가되지 않아야 한다.
-# 이 테스트는 UX와 데이터 일관성을 보장하고, 실수로 장바구니 수량이 늘어나는 문제를 막는다.
-# 중복 상품이 섞이면 체크아웃 단계에서 총액·수량 계산이 잘못될 수 있다.
-def test_same_product_is_not_duplicated_in_cart(page):
+# 상품을 추가하면 버튼이 Remove로 전환되고 다시 누르면 상품이 제거되는지 검증한다.
+# 이 테스트는 상품 카드의 상태 전환과 장바구니 배지 갱신을 확인한다.
+def test_add_button_changes_to_remove_and_removes_item(page):
     LoginPage(page).login(**STANDARD_USER)
     products = ProductsPage(page)
     item = products.page.locator(DEFAULT_CONFIG.selectors["products"]["inventory_item"]).filter(has_text=DEFAULT_CONFIG.products["backpack"])

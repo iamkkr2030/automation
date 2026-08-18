@@ -100,7 +100,10 @@ LOCKED_OUT_USER = {"username": "locked_out_user", "password": "secret_sauce"}
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium
 ```
+
+Playwright 패키지와 브라우저 실행 파일은 별도로 설치해야 합니다. CI에서는 Chromium과 운영체제 의존성을 자동으로 설치합니다.
 
 ### 전체 테스트 실행
 
@@ -183,7 +186,7 @@ pytest --slowmo 200 -q
 - 상품 추가
 - 여러 상품 추가
 - 상품 제거
-- 중복 추가 방지 검증
+- 상품 추가/제거 버튼 상태 전환 검증
 - 빈 장바구니 상태 검증
 - Continue Shopping 동작 확인
 - 비어 있는 장바구니에서 체크아웃 버튼 비활성화 검증
@@ -227,7 +230,7 @@ pytest --slowmo 200 -q
 ### 장바구니
 - `test_add_and_remove_cart_item`
 - `test_add_multiple_cart_items`
-- `test_same_product_is_not_duplicated_in_cart`
+- `test_add_button_changes_to_remove_and_removes_item`
 - `test_remove_last_item_leaves_cart_empty`
 - `test_continue_shopping_returns_to_products`
 - `test_remove_one_of_multiple_items_keeps_remaining_items`
